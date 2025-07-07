@@ -1,0 +1,1079 @@
+limpieza_csv.py
+import streamlit as st
+import pandas as pd
+import base64
+from io import StringIO, BytesIO
+import tempfile
+import os
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from typing import Optional, List, Union
+import logging
+import sys
+import os
+
+# Agregar el directorio padre al path para imports
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# ========================================
+# CONFIGURACIÓN INICIAL
+# ========================================
+
+# Configuración de logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Configuración de la página Streamlit
+st.set_page_config(
+    page_title="Data Cleaner Pro",
+    page_icon="🧹",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# ========================================
+# CONSTANTES Y CONFIGURACIÓN
+# ========================================
+
+# Configuración de base de datos
+DB_CONFIG = {
+    "USER": "prueba",
+    "PASSWORD": "prueba1234", 
+    "HOST": "localhost",
+    "PORT": "5432",
+    "DB": "testdb"
+}
+
+# Configuración de procesamiento
+PROCESSING_CONFIG = {
+    "LARGE_FILE_CHUNK_SIZE": 100000,
+    "DB_INSERT_CHUNK_SIZE": 10000,
+    "DEFAULT_LIMIT": 1000,
+    "SUPPORTED_DELIMITERS": [',', ';', '\t', '|']
+}
+
+# ========================================
+# ESTILOS PERSONALIZADOS
+# ========================================
+
+def apply_custom_styles():
+    """Aplica estilos CSS personalizados a la aplicación."""
+    custom_css = """
+    <style>
+    .stApp { 
+        background-color: #f5f5f5; 
+    }
+    .stButton>button {
+        border: 2px solid #4CAF50;
+        border-radius: 20px;
+        color: white;
+        background-color: #4CAF50;
+        transition: all 0.3s;
+        font-weight: bold;
+    }
+    .stButton>button:hover {
+        background-color: white;
+        color: #4CAF50;
+        transform: translateY(-2px);
+        box-shadow: 0 4px 8px rgba(0,0,0,0.2);
+    }
+    h1 { 
+        color: #FF4B4B; 
+        text-align: center; 
+        margin-bottom: 2rem;
+    }
+    .stFileUploader>div>div>div>div {
+        border: 2px dashed #4CAF50;
+        border-radius: 10px;
+        padding: 2rem;
+    }
+    .metric-card {
+        background-color: white;
+        padding: 1rem;
+        border-radius: 10px;
+        border-left: 4px solid #4CAF50;
+        margin: 0.5rem 0;
+    }
+    #MainMenu {visibility: hidden;}
+    footer {visibility: hidden;}
+    </style>
+    """
+    st.markdown(custom_css, unsafe_allow_html=True)
+
+# ========================================
+# CONEXIÓN A BASE DE DATOS
+# ========================================
+
+class DatabaseManager:
+    """Maneja las conexiones y operaciones con PostgreSQL."""
+    
+    def __init__(self):
+        self.engine = None
+        self._initialize_connection()
+    
+    def _initialize_connection(self):
+        """Inicializa la conexión a PostgreSQL."""
+        try:
+            # Intentar usar la función de utils/db.py si existe
+            try:
+                from utils.db import get_engine
+                self.engine = get_engine()
+                logger.info("Conexión a PostgreSQL establecida usando utils.db")
+            except ImportError:
+                # Fallback a configuración directa
+                database_url = (
+                    f"postgresql+psycopg2://{DB_CONFIG['USER']}:{DB_CONFIG['PASSWORD']}"
+                    f"@{DB_CONFIG['HOST']}:{DB_CONFIG['PORT']}/{DB_CONFIG['DB']}"
+                )
+                self.engine = create_engine(database_url)
+                logger.info("Conexión a PostgreSQL establecida directamente")
+        except Exception as e:
+            logger.error(f"Error conectando a PostgreSQL: {str(e)}")
+            st.error("Error de conexión a base de datos. Verifica la configuración.")
+    
+    def get_session(self):
+        """Obtiene una sesión de SQLAlchemy."""
+        if self.engine:
+            Session = sessionmaker(bind=self.engine)
+            return Session()
+        return None
+    
+    def save_dataframe(self, df: pd.DataFrame, table_name: str = 'raw_data', 
+                      if_exists: str = 'replace') -> bool:
+        """
+        Guarda DataFrame en PostgreSQL con chunks para grandes volúmenes.
+        
+        Args:
+            df: DataFrame a guardar
+            table_name: Nombre de la tabla
+            if_exists: Comportamiento si la tabla existe ('replace', 'append', 'fail')
+        
+        Returns:
+            bool: True si se guardó correctamente, False en caso contrario
+        """
+        try:
+            df.to_sql(
+                table_name,
+                self.engine,
+                if_exists=if_exists,
+                index=False,
+                chunksize=PROCESSING_CONFIG['DB_INSERT_CHUNK_SIZE'],
+                method='multi'
+            )
+            logger.info(f"DataFrame guardado en tabla '{table_name}' correctamente")
+            return True
+        except Exception as e:
+            logger.error(f"Error guardando DataFrame: {str(e)}")
+            st.error(f"Error guardando en PostgreSQL: {str(e)}")
+            return False
+    
+    def load_dataframe(self, table_name: str = 'raw_data', 
+                      limit: Optional[int] = None) -> pd.DataFrame:
+        """
+        Carga datos desde PostgreSQL con límite opcional.
+        
+        Args:
+            table_name: Nombre de la tabla
+            limit: Límite de filas a cargar (None para cargar todas)
+        
+        Returns:
+            pd.DataFrame: DataFrame con los datos cargados
+        """
+        try:
+            if limit:
+                query = f"SELECT * FROM {table_name} LIMIT {limit}"
+            else:
+                query = f"SELECT * FROM {table_name}"
+            
+            df = pd.read_sql(query, self.engine)
+            logger.info(f"Datos cargados desde tabla '{table_name}': {len(df)} filas")
+            return df
+        except Exception as e:
+            logger.error(f"Error cargando datos: {str(e)}")
+            st.error(f"Error cargando desde PostgreSQL: {str(e)}")
+            return pd.DataFrame()
+
+# ========================================
+# PROCESAMIENTO DE ARCHIVOS
+# ========================================
+
+class FileProcessor:
+    """Maneja el procesamiento y limpieza de archivos CSV."""
+    
+    def __init__(self, db_manager: DatabaseManager):
+        self.db_manager = db_manager
+    
+    def validate_file(self, file) -> bool:
+        """
+        Valida si un archivo tiene contenido válido.
+        
+        Args:
+            file: Archivo subido por Streamlit
+        
+        Returns:
+            bool: True si el archivo es válido, False en caso contrario
+        """
+        try:
+            content = file.getvalue().decode('utf-8')
+            lines = [line for line in content.split('\n') if line.strip()]
+            return len(lines) > 1
+        except Exception as e:
+            logger.error(f"Error validando archivo {file.name}: {str(e)}")
+            return False
+    
+    def detect_delimiter(self, content: str) -> str:
+        """
+        Detecta automáticamente el delimitador del archivo CSV.
+        
+        Args:
+            content: Contenido del archivo como string
+        
+        Returns:
+            str: Delimitador detectado
+        """
+        for delimiter in PROCESSING_CONFIG['SUPPORTED_DELIMITERS']:
+            try:
+                df = pd.read_csv(StringIO(content), delimiter=delimiter, nrows=5)
+                if not df.empty and len(df.columns) > 1:
+                    return delimiter
+            except:
+                continue
+        return ','  # Default delimiter
+    
+    def process_regular_file(self, file) -> Optional[pd.DataFrame]:
+        """
+        Procesa un archivo CSV regular (no muy grande).
+        
+        Args:
+            file: Archivo subido por Streamlit
+        
+        Returns:
+            Optional[pd.DataFrame]: DataFrame procesado o None si hay error
+        """
+        try:
+            if not self.validate_file(file):
+                st.warning(f"{file.name} no tiene datos válidos.")
+                return None
+            
+            content = file.getvalue().decode('utf-8')
+            delimiter = self.detect_delimiter(content)
+            
+            df = pd.read_csv(StringIO(content), delimiter=delimiter)
+            logger.info(f"Archivo {file.name} procesado: {len(df)} filas, {len(df.columns)} columnas")
+            return df
+            
+        except Exception as e:
+            logger.error(f"Error procesando archivo {file.name}: {str(e)}")
+            st.error(f"Error procesando {file.name}: {str(e)}")
+            return None
+    
+    def process_large_file(self, file) -> bool:
+        """
+        Procesa archivos grandes usando chunks y los almacena en PostgreSQL.
+        
+        Args:
+            file: Archivo subido por Streamlit
+        
+        Returns:
+            bool: True si se procesó correctamente, False en caso contrario
+        """
+        try:
+            chunksize = PROCESSING_CONFIG['LARGE_FILE_CHUNK_SIZE']
+            first_chunk = True
+            total_rows = 0
+            
+            # Procesar archivo por chunks
+            for chunk in pd.read_csv(file, chunksize=chunksize):
+                # Limpiar chunk básico
+                chunk = chunk.dropna(how='all')
+                total_rows += len(chunk)
+                
+                if first_chunk:
+                    # Reemplazar tabla en primer chunk
+                    success = self.db_manager.save_dataframe(chunk, 'raw_data', 'replace')
+                    first_chunk = False
+                else:
+                    # Anexar chunks subsiguientes
+                    success = self.db_manager.save_dataframe(chunk, 'raw_data', 'append')
+                
+                if not success:
+                    return False
+            
+            logger.info(f"Archivo grande procesado: {total_rows} filas totales")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error procesando archivo grande: {str(e)}")
+            st.error(f"Error procesando archivo grande: {str(e)}")
+            return False
+    
+    def clean_dataframe(self, df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
+        """
+        Limpia un DataFrame eliminando filas/columnas vacías y duplicados.
+        
+        Args:
+            df: DataFrame a limpiar
+        
+        Returns:
+            tuple: (DataFrame limpio, estadísticas de limpieza)
+        """
+        initial_shape = df.shape
+        
+        # Eliminar filas completamente vacías
+        df = df.dropna(how='all')
+        
+        # Eliminar columnas completamente vacías
+        df = df.dropna(axis=1, how='all')
+        
+        # Eliminar duplicados
+        df = df.drop_duplicates()
+        
+        # Resetear índice
+        df = df.reset_index(drop=True)
+        
+        # Limpiar tipos de datos para compatibilidad con Arrow
+        df = self._fix_dtypes_for_display(df)
+        
+        final_shape = df.shape
+        
+        cleaning_stats = {
+            'filas_iniciales': initial_shape[0],
+            'filas_finales': final_shape[0],
+            'columnas_iniciales': initial_shape[1],
+            'columnas_finales': final_shape[1],
+            'filas_eliminadas': initial_shape[0] - final_shape[0],
+            'columnas_eliminadas': initial_shape[1] - final_shape[1]
+        }
+        
+        logger.info(f"DataFrame limpiado: {initial_shape} → {final_shape}")
+        return df, cleaning_stats
+    
+    def _fix_dtypes_for_display(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Corrige los tipos de datos para compatibilidad con Streamlit/Arrow.
+        
+        Args:
+            df: DataFrame a corregir
+        
+        Returns:
+            pd.DataFrame: DataFrame con tipos corregidos
+        """
+        df_copy = df.copy()
+        
+        for col in df_copy.columns:
+            if df_copy[col].dtype == 'object':
+                try:
+                    # Intentar convertir a string de forma segura
+                    df_copy[col] = df_copy[col].astype(str)
+                    
+                    # Reemplazar valores problemáticos
+                    df_copy[col] = df_copy[col].replace({
+                        'nan': '',
+                        'None': '',
+                        'null': '',
+                        'NaN': '',
+                        '<NA>': ''
+                    })
+                    
+                    # Si es la columna "Tipo" específicamente, asegurar que sea string
+                    if col.lower() == 'tipo':
+                        df_copy[col] = df_copy[col].astype(str)
+                        continue
+                    
+                    # Para otras columnas, intentar conversión numérica
+                    if len(df_copy[col].dropna()) > 0:
+                        # Verificar si todos los valores no vacíos son numéricos
+                        non_empty_values = df_copy[col][df_copy[col] != ''].dropna()
+                        if len(non_empty_values) > 0:
+                            # Intentar convertir una muestra pequeña
+                            sample_size = min(100, len(non_empty_values))
+                            sample = non_empty_values.head(sample_size)
+                            
+                            try:
+                                pd.to_numeric(sample, errors='raise')
+                                # Si funciona, convertir toda la columna
+                                df_copy[col] = pd.to_numeric(df_copy[col], errors='coerce')
+                            except (ValueError, TypeError):
+                                # Si no es numérico, mantener como string
+                                pass
+                                
+                except Exception as e:
+                    # Si hay cualquier error, forzar a string
+                    logger.warning(f"Error procesando columna {col}: {str(e)}")
+                    df_copy[col] = df_copy[col].astype(str).fillna('')
+        
+        # Verificar que no haya tipos problemáticos restantes
+        for col in df_copy.columns:
+            if df_copy[col].dtype == 'object':
+                # Forzar conversión final a string para asegurar compatibilidad
+                df_copy[col] = df_copy[col].astype(str)
+        
+        return df_copy
+
+# ========================================
+# UTILIDADES DE DESCARGA
+# ========================================
+
+class DownloadManager:
+    """Maneja la generación de archivos para descarga."""
+    
+    @staticmethod
+    def create_csv_download_link(df: pd.DataFrame, filename: str = "datos_limpios.csv") -> str:
+        """
+        Crea un enlace de descarga para CSV.
+        
+        Args:
+            df: DataFrame a convertir
+            filename: Nombre del archivo
+        
+        Returns:
+            str: HTML del enlace de descarga
+        """
+        csv = df.to_csv(index=False, encoding='utf-8-sig')
+        b64 = base64.b64encode(csv.encode()).decode()
+        href = f'<a href="data:file/csv;base64,{b64}" download="{filename}" class="download-link">📥 Descargar CSV</a>'
+        return href
+    
+    @staticmethod
+    def create_excel_download_link(df: pd.DataFrame, filename: str = "datos_limpios.xlsx") -> str:
+        """
+        Crea un enlace de descarga para Excel.
+        
+        Args:
+            df: DataFrame a convertir
+            filename: Nombre del archivo
+        
+        Returns:
+            str: HTML del enlace de descarga
+        """
+        output = BytesIO()
+        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+            df.to_excel(writer, index=False, sheet_name='DatosLimpios')
+        b64 = base64.b64encode(output.getvalue()).decode()
+        href = f'<a href="data:application/vnd.ms-excel;base64,{b64}" download="{filename}" class="download-link">📥 Descargar Excel</a>'
+        return href
+
+# ========================================
+# INTERFAZ DE USUARIO
+# ========================================
+
+def display_dataframe_info(df: pd.DataFrame):
+    """
+    Muestra información detallada sobre un DataFrame.
+    
+    Args:
+        df: DataFrame a analizar
+    """
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        st.metric("Filas", f"{df.shape[0]:,}")
+    
+    with col2:
+        st.metric("Columnas", f"{df.shape[1]:,}")
+    
+    with col3:
+        memory_usage = df.memory_usage(deep=True).sum() / 1024 / 1024  # MB
+        st.metric("Memoria", f"{memory_usage:.2f} MB")
+    
+    with col4:
+        null_count = df.isnull().sum().sum()
+        st.metric("Valores nulos", f"{null_count:,}")
+    
+    # Información adicional
+    with st.expander("Ver información detallada"):
+        st.subheader("Tipos de datos")
+        type_info = pd.DataFrame({
+            'Columna': df.columns,
+            'Tipo': df.dtypes.values,
+            'Valores únicos': [df[col].nunique() for col in df.columns],
+            'Valores nulos': [df[col].isnull().sum() for col in df.columns]
+        })
+        st.dataframe(type_info)
+
+def display_cleaning_stats(stats: dict):
+    """
+    Muestra estadísticas de limpieza de datos.
+    
+    Args:
+        stats: Diccionario con estadísticas de limpieza
+    """
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.markdown("### 📊 Estadísticas de Limpieza")
+        st.markdown(f"**Filas:** {stats['filas_iniciales']:,} → {stats['filas_finales']:,}")
+        st.markdown(f"**Columnas:** {stats['columnas_iniciales']:,} → {stats['columnas_finales']:,}")
+    
+    with col2:
+        if stats['filas_eliminadas'] > 0:
+            st.markdown(f"**Filas eliminadas:** {stats['filas_eliminadas']:,}")
+        if stats['columnas_eliminadas'] > 0:
+            st.markdown(f"**Columnas eliminadas:** {stats['columnas_eliminadas']:,}")
+
+# ========================================
+# APLICACIÓN PRINCIPAL
+# ========================================
+
+def main():
+    """Función principal de la aplicación."""
+    
+    # Aplicar estilos
+    apply_custom_styles()
+    
+    # Título y descripción
+    st.title("🧹 Data Cleaner Pro")
+    st.markdown("### Herramienta profesional para limpieza y procesamiento de archivos CSV")
+    st.markdown("Sube archivos CSV para limpiarlos, procesarlos y prepararlos para análisis.")
+    
+    # Inicializar managers
+    db_manager = DatabaseManager()
+    file_processor = FileProcessor(db_manager)
+    download_manager = DownloadManager()
+    
+    # Sidebar con información
+    with st.sidebar:
+        st.header("ℹ️ Información")
+        st.markdown("**Características:**")
+        st.markdown("- Procesamiento de archivos grandes")
+        st.markdown("- Limpieza automática de datos")
+        st.markdown("- Almacenamiento en PostgreSQL")
+        st.markdown("- Múltiples formatos de descarga")
+        st.markdown("- Detección automática de delimitadores")
+        
+        st.markdown("**Formatos soportados:**")
+        st.markdown("- CSV (.csv)")
+        st.markdown("- Texto delimitado (.txt)")
+        
+        st.markdown("**Delimitadores soportados:**")
+        st.markdown("- Coma (,)")
+        st.markdown("- Punto y coma (;)")
+        st.markdown("- Tabulador (\\t)")
+        st.markdown("- Pipe (|)")
+    
+    # Subir archivos
+    st.header("📁 Subir Archivos")
+    uploaded_files = st.file_uploader(
+        "Selecciona archivos CSV",
+        type=["csv", "txt"],
+        accept_multiple_files=True,
+        help="Puedes subir múltiples archivos CSV o TXT"
+    )
+    
+    if uploaded_files:
+        st.success(f"Se subieron {len(uploaded_files)} archivo(s):")
+        for file in uploaded_files:
+            file_size = file.size / 1024 / 1024  # MB
+            st.write(f"- **{file.name}** ({file_size:.2f} MB)")
+        
+        # Opciones de procesamiento
+        st.header("⚙️ Procesamiento")
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            if st.button("🚀 Procesar Archivos Grandes", use_container_width=True):
+                with st.spinner("Procesando archivos grandes..."):
+                    success_count = 0
+                    for file in uploaded_files:
+                        if file_processor.process_large_file(file):
+                            success_count += 1
+                            st.success(f"✅ {file.name} procesado y almacenado")
+                        else:
+                            st.error(f"❌ Error procesando {file.name}")
+                    
+                    if success_count > 0:
+                        raw_data = db_manager.load_dataframe('raw_data')
+                        if not raw_data.empty:
+                            # Aplicar limpieza de tipos para visualización
+                            cleaned_data = file_processor._fix_dtypes_for_display(raw_data)
+                            st.session_state.cleaned_data = cleaned_data
+                            st.header("📊 Vista Previa de Datos")
+                            display_dataframe_info(st.session_state.cleaned_data)
+                            st.dataframe(st.session_state.cleaned_data.head(100))
+        
+        with col2:
+            if st.button("🔍 Procesar y Limpiar", use_container_width=True):
+                with st.spinner("Analizando y limpiando datos..."):
+                    valid_dataframes = []
+                    
+                    # Procesar cada archivo
+                    for file in uploaded_files:
+                        df = file_processor.process_regular_file(file)
+                        if df is not None:
+                            valid_dataframes.append(df)
+                    
+                    if not valid_dataframes:
+                        st.error("❌ No se encontraron datos válidos en los archivos.")
+                    else:
+                        # Combinar DataFrames si hay múltiples
+                        if len(valid_dataframes) > 1:
+                            combined_df = pd.concat(valid_dataframes, ignore_index=True)
+                            st.info(f"Se combinaron {len(valid_dataframes)} archivos")
+                        else:
+                            combined_df = valid_dataframes[0]
+                        
+                        # Limpiar datos
+                        cleaned_df, cleaning_stats = file_processor.clean_dataframe(combined_df)
+                        
+                        # Guardar en session state
+                        st.session_state.cleaned_data = cleaned_df
+                        st.session_state.cleaning_stats = cleaning_stats
+                        
+                        # Mostrar resultados
+                        st.header("🎉 Limpieza Completada")
+                        display_cleaning_stats(cleaning_stats)
+                        
+                        st.header("📊 Datos Limpios")
+                        display_dataframe_info(cleaned_df)
+                        st.dataframe(cleaned_df.head(100))
+    
+    # Sección de descarga
+    if 'cleaned_data' in st.session_state and st.session_state.cleaned_data is not None:
+        df = st.session_state.cleaned_data
+        
+        st.header("📥 Descargar Datos")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            csv_link = download_manager.create_csv_download_link(df)
+            st.markdown(csv_link, unsafe_allow_html=True)
+        
+        with col2:
+            excel_link = download_manager.create_excel_download_link(df)
+            st.markdown(excel_link, unsafe_allow_html=True)
+        
+        st.success("✅ Datos listos para descargar")
+        
+        # Mostrar estadísticas finales
+        if 'cleaning_stats' in st.session_state:
+            st.header("📈 Resumen Final")
+            stats = st.session_state.cleaning_stats
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                st.metric(
+                    "Eficiencia de Limpieza",
+                    f"{(stats['filas_finales']/stats['filas_iniciales']*100):.1f}%",
+                    f"{stats['filas_eliminadas']} filas eliminadas"
+                )
+            
+            with col2:
+                st.metric(
+                    "Calidad de Datos",
+                    f"{((df.shape[0] * df.shape[1] - df.isnull().sum().sum()) / (df.shape[0] * df.shape[1]) * 100):.1f}%",
+                    "Completitud de datos"
+                )
+            
+            with col3:
+                st.metric(
+                    "Tamaño Final",
+                    f"{df.memory_usage(deep=True).sum() / 1024 / 1024:.2f} MB",
+                    f"{df.shape[0]:,} filas"
+                )
+    
+    else:
+        st.info("👆 Sube archivos CSV y procesalos para habilitar la descarga.")
+
+# ========================================
+# PUNTO DE ENTRADA
+# ========================================
+
+if __name__ == "__main__":
+    main()
+###########################################################
+transformacion.py
+import streamlit as st
+import pandas as pd
+import base64
+from io import StringIO, BytesIO
+import tempfile
+import os
+# import sqlite3  # Necesario para SQLite
+from utils.db import get_engine
+
+# ----------------------------------------
+# CONFIGURACIÓN GENERAL
+# ----------------------------------------
+st.set_page_config(
+    page_title="Data Cleaner Pro",
+    page_icon="🧹",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# ----------------------------------------
+# ESTILOS PERSONALIZADOS
+# ----------------------------------------
+custom_css = """
+<style>
+.stApp { background-color: #f5f5f5; }
+.stButton>button {
+    border: 2px solid #4CAF50;
+    border-radius: 20px;
+    color: white;
+    background-color: #4CAF50;
+    transition: all 0.3s;
+}
+.stButton>button:hover {
+    background-color: white;
+    color: #4CAF50;
+}
+h1 { color: #FF4B4B; text-align: center; }
+.stFileUploader>div>div>div>div {
+    border: 2px dashed #4CAF50;
+}
+#MainMenu {visibility: hidden;}
+footer {visibility: hidden;}
+</style>
+"""
+st.markdown(custom_css, unsafe_allow_html=True)
+
+# ----------------------------------------
+# TÍTULO
+# ----------------------------------------
+st.title("🧹 Herramienta de Limpieza CSV")
+st.markdown("Sube archivos CSV para limpiarlos y prepararlos para análisis.")
+
+engine = get_engine()
+st.title("🔄 Transformación de Datos Avanzada")
+
+# Función optimizada para transformaciones
+def apply_transformations(df):
+    """Aplica transformaciones y guarda en nueva tabla"""
+    try:
+        # 1. Normalización de columnas numéricas
+        numeric_cols = df.select_dtypes(include='number').columns
+        if not numeric_cols.empty:
+            df[numeric_cols] = (df[numeric_cols] - df[numeric_cols].mean()) / df[numeric_cols].std()
+        
+        # 2. Guardar en nueva tabla
+        df.to_sql(
+            'transformed_data',
+            engine,
+            if_exists='replace',
+            index=False,
+            chunksize=10000
+        )
+        
+        return True
+    except Exception as e:
+        st.error(f"Error en transformación: {str(e)}")
+        return False
+
+# Interfaz principal
+if st.button("Cargar Datos para Transformar"):
+    df = pd.read_sql("SELECT * FROM raw_data LIMIT 10000", engine)
+    
+    if not df.empty:
+        st.session_state.df = df
+        st.dataframe(df.head())
+    else:
+        st.warning("No hay datos disponibles para transformar")
+
+if 'df' in st.session_state:
+    df = st.session_state.df
+    
+    st.subheader("Opciones de Transformación")
+    
+    # Selección de columnas
+    available_cols = df.columns.tolist()
+    selected_cols = st.multiselect("Selecciona columnas a transformar", available_cols)
+    
+    if selected_cols:
+        if st.button("Aplicar Transformaciones Seleccionadas"):
+            with st.spinner("Transformando datos..."):
+                if apply_transformations(df[selected_cols]):
+                    st.success("✅ Transformaciones completadas y guardadas en PostgreSQL")
+                    
+                    # Mostrar resultados
+                    transformed_df = pd.read_sql(
+                        "SELECT * FROM transformed_data LIMIT 1000", 
+                        engine
+                    )
+                    st.dataframe(transformed_df.head())
+
+
+# ----------------------------------------
+# PROCESAMIENTO DE ARCHIVOS GRANDES
+# ----------------------------------------
+def process_large_file(file):
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as tmp:
+            tmp.write(file.getvalue())
+            tmp_path = tmp.name
+
+        chunksize = 100000
+        for chunk in pd.read_csv(tmp_path, chunksize=chunksize):
+            chunk = chunk.dropna(how='all')
+            save_to_db(chunk, 'raw_data')
+
+        os.unlink(tmp_path)
+        return True
+    except Exception as e:
+        st.error(f"Error procesando archivo: {e}")
+        return False
+
+# ----------------------------------------
+# PROCESAMIENTO DE ARCHIVOS NORMALES
+# ----------------------------------------
+def validate_file(file):
+    content = file.getvalue().decode('utf-8')
+    lines = [line for line in content.split('\n') if line.strip()]
+    return len(lines) > 1
+
+def process_file(file):
+    try:
+        content = file.getvalue().decode('utf-8')
+
+        if not validate_file(file):
+            st.warning(f"{file.name} no tiene datos válidos.")
+            return None
+
+        delimiters = [',', ';', '\t', '|']
+        for delim in delimiters:
+            try:
+                df = pd.read_csv(StringIO(content), delimiter=delim)
+                if not df.empty and len(df.columns) > 1:
+                    return df
+            except:
+                continue
+
+        return pd.read_csv(StringIO(content))
+
+    except Exception as e:
+        st.error(f"Error procesando {file.name}: {e}")
+        return None
+
+
+# ----------------------------------------
+# SUBIR ARCHIVOS
+# ----------------------------------------
+uploaded_files = st.file_uploader(
+    "Selecciona archivos CSV",
+    type=["csv", "txt"],
+    accept_multiple_files=True
+)
+
+if uploaded_files:
+    st.write("Archivos subidos:")
+    for file in uploaded_files:
+        st.write(f"- {file.name} ({file.size} bytes)")
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        if st.button("Procesar Archivos Grandes"):
+            with st.spinner("Procesando archivos grandes..."):
+                for file in uploaded_files:
+                    if process_large_file(file):
+                        st.success(f"{file.name} procesado y almacenado.")
+                st.session_state.cleaned_data = load_from_db('raw_data')
+                st.dataframe(st.session_state.cleaned_data.head())
+
+    with col2:
+        if st.button("🔍 Analizar y Limpiar"):
+            valid_files = [process_file(file) for file in uploaded_files if process_file(file) is not None]
+
+            if not valid_files:
+                st.error("No se encontraron datos válidos.")
+            else:
+                df = pd.concat(valid_files, ignore_index=True) if len(valid_files) > 1 else valid_files[0]
+                initial_count = len(df)
+
+                df = df.dropna(how='all').dropna(axis=1, how='all').drop_duplicates()
+                final_count = len(df)
+
+                st.session_state.cleaned_data = df
+                st.success(f"Limpieza: {initial_count} → {final_count} filas.")
+                st.dataframe(df.head())
+
+                st.subheader("Metadatos")
+                st.json({
+                    "Filas": int(df.shape[0]),
+                    "Columnas": int(df.shape[1]),
+                    "Tamaño en memoria": f"{df.memory_usage().sum() / 1024:.2f} KB",
+                    "Tipos de datos": df.dtypes.apply(str).to_dict()
+                })
+
+
+# ----------------------------------------
+# DESCARGA DE ARCHIVOS
+# ----------------------------------------
+if 'cleaned_data' in st.session_state and st.session_state.cleaned_data is not None:
+    df = st.session_state.cleaned_data
+
+    st.subheader("Descargar Datos")
+    col1, col2 = st.columns(2)
+
+    with col1:
+        csv = df.to_csv(index=False, encoding='utf-8-sig')
+        b64 = base64.b64encode(csv.encode()).decode()
+        href = f'<a href="data:file/csv;base64,{b64}" download="datos_limpios.csv">📥 Descargar CSV</a>'
+        st.markdown(href, unsafe_allow_html=True)
+
+    with col2:
+        output = BytesIO()
+        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+            df.to_excel(writer, index=False, sheet_name='DatosLimpios')
+        b64 = base64.b64encode(output.getvalue()).decode()
+        href = f'<a href="data:application/vnd.ms-excel;base64,{b64}" download="datos_limpios.xlsx">📥 Descargar Excel</a>'
+        st.markdown(href, unsafe_allow_html=True)
+
+    st.success("Datos listos para descargar.")
+else:
+    st.info("Sube y limpia datos para habilitar la descarga.")
+######################################################################################3
+db.py
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
+def get_engine():
+    USER = "prueba"
+    PASSWORD = "prueba1234"
+    HOST = "localhost"
+    PORT = "5432"
+    DB = "testdb"
+    
+    # Conexión correctamente formateada
+    DATABASE_URL = f"postgresql+psycopg2://{USER}:{PASSWORD}@{HOST}:{PORT}/{DB}"
+    
+    # Configuración adicional para mejor rendimiento
+    engine = create_engine(
+        DATABASE_URL,
+        pool_size=10,
+        max_overflow=20,
+        pool_pre_ping=True,
+        echo=False  # Cambia a True para debug
+    )
+    return engine
+
+def get_session():
+    engine = get_engine()
+    Session = sessionmaker(bind=engine)
+    return Session()
+#########################
+este es el tree: 
+.
+├── main.py
+├── notas.txt
+├── pages
+│   ├── limpieza_csv.py
+│   └── transformacion.py
+├── requirements.txt
+├── temp_data.db
+└── utils
+    ├── db.py
+    └── __pycache__
+        └── db.cpython-312.pyc
+
+
+    try:
+        # Usar el detector de CSV de Python
+        sample = content[:1024]  # Muestra pequeña
+        sniffer = csv.Sniffer()
+        delimiter = sniffer.sniff(sample).delimiter
+        
+        # Validar que el delimitador detectado funciona
+        test_df = pd.read_csv(StringIO(content), delimiter=delimiter, nrows=5)
+        if len(test_df.columns) > 1:
+            return delimiter
+    except:
+        pass
+
+
+altair==5.5.0
+attrs==25.3.0
+blinker==1.9.0
+cachetools==6.1.0
+certifi==2025.6.15
+charset-normalizer==3.4.2
+click==8.2.1
+gitdb==4.0.12
+GitPython==3.1.44
+idna==3.10
+Jinja2==3.1.6
+jsonschema==4.24.0
+jsonschema-specifications==2025.4.1
+MarkupSafe==3.0.2
+narwhals==1.45.0
+numpy==2.3.1
+packaging==25.0
+pandas==2.3.0
+pillow==11.3.0
+protobuf==6.31.1
+pyarrow==20.0.0
+pydeck==0.9.1
+python-dateutil==2.9.0.post0
+pytz==2025.2
+referencing==0.36.2
+requests==2.32.4
+rpds-py==0.26.0
+six==1.17.0
+smmap==5.0.2
+streamlit==1.46.1
+tenacity==9.1.2
+toml==0.10.2
+tornado==6.5.1
+typing_extensions==4.14.1
+tzdata==2025.2
+urllib3==2.5.0
+watchdog==6.0.0
+sqlalchemy>=2.0
+psycopg2-binary>=2.9
+
+#############################################
+
+errores:
+(proy1env) vbox@vbox:~/Desktop/proyecto_limpieza_csv$ streamlit run main.py
+
+  You can now view your Streamlit app in your browser.
+
+  URL: http://localhost:8501
+
+INFO:__main__:Conexión a PostgreSQL establecida usando utils.db
+INFO:__main__:Conexión a PostgreSQL establecida usando utils.db
+INFO:__main__:Conexión a PostgreSQL establecida usando utils.db
+INFO:__main__:DataFrame guardado en tabla 'raw_data' correctamente
+INFO:__main__:Datos cargados desde tabla 'raw_data': 1000 filas
+2025-07-06 15:47:03.206 Serialization of dataframe to Arrow table was unsuccessful. Applying automatic fixes for column types to make the dataframe Arrow-compatible.
+Traceback (most recent call last):
+  File "/home/vbox/Desktop/proyecto_limpieza_csv/proy1env/lib/python3.12/site-packages/streamlit/dataframe_util.py", line 822, in convert_pandas_df_to_arrow_bytes
+    table = pa.Table.from_pandas(df)
+            ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "pyarrow/table.pxi", line 4793, in pyarrow.lib.Table.from_pandas
+  File "/home/vbox/Desktop/proyecto_limpieza_csv/proy1env/lib/python3.12/site-packages/pyarrow/pandas_compat.py", line 639, in dataframe_to_arrays
+    arrays = [convert_column(c, f)
+              ^^^^^^^^^^^^^^^^^^^^
+  File "/home/vbox/Desktop/proyecto_limpieza_csv/proy1env/lib/python3.12/site-packages/pyarrow/pandas_compat.py", line 626, in convert_column
+    raise e
+  File "/home/vbox/Desktop/proyecto_limpieza_csv/proy1env/lib/python3.12/site-packages/pyarrow/pandas_compat.py", line 620, in convert_column
+    result = pa.array(col, type=type_, from_pandas=True, safe=safe)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "pyarrow/array.pxi", line 365, in pyarrow.lib.array
+  File "pyarrow/array.pxi", line 90, in pyarrow.lib._ndarray_to_array
+  File "pyarrow/error.pxi", line 92, in pyarrow.lib.check_status
+pyarrow.lib.ArrowInvalid: ("Could not convert dtype('O') with type numpy.dtypes.ObjectDType: did not recognize Python value type when inferring an Arrow data type", 'Conversion failed for column Tipo with type object')
+
+
+############################################################################################3
+
+Recomendaciones Clave:
+Manejo de Errores Mejorado:
+En db.py, añade reintentos automáticos para conexiones fallidas
+Registra errores detallados (logging)
+Configuración Centralizada:
+Crea un config.py para parámetros como:
+CHUNK_SIZE = 50000  # Para procesamiento de archivos grandes
+MAX_DB_RETRIES = 3
+Testing:
+Añade tests básicos para db.py y las funciones core
+Documentación:
+Añade un README.md con:
+markdown
+# Data Analysis Suite
+## Requisitos
+- Python 3.10+
+- PostgreSQL
+## Instalación
+1. `pip install -r requirements.txt`
